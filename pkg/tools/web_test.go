@@ -197,6 +197,99 @@ func TestWebTool_WebSearch_MissingQuery(t *testing.T) {
 	}
 }
 
+// TestWebTool_WebSearch_ExaProviderSelected verifies Exa is selected when enabled and Brave is disabled
+func TestWebTool_WebSearch_ExaProviderSelected(t *testing.T) {
+	tool := NewWebSearchTool(WebSearchToolOptions{
+		ExaAPIKey:            "exa-test-key",
+		ExaMaxResults:        3,
+		ExaEnabled:           true,
+		DuckDuckGoEnabled:    true,
+		DuckDuckGoMaxResults: 5,
+	})
+
+	if tool == nil {
+		t.Fatal("Expected web search tool to be created")
+	}
+
+	if tool.maxResults != 3 {
+		t.Fatalf("Expected maxResults 3, got %d", tool.maxResults)
+	}
+
+	if _, ok := tool.provider.(*ExaSearchProvider); !ok {
+		t.Fatalf("Expected ExaSearchProvider, got %T", tool.provider)
+	}
+}
+
+func TestExaSearchProvider_Search_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if got := r.Header.Get("x-api-key"); got != "exa-test-key" {
+			t.Fatalf("expected x-api-key header, got %q", got)
+		}
+
+		var payload map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("failed to decode request payload: %v", err)
+		}
+		if payload["query"] != "sam altman blog" {
+			t.Fatalf("unexpected query: %v", payload["query"])
+		}
+		if payload["type"] != "auto" {
+			t.Fatalf("unexpected type: %v", payload["type"])
+		}
+		if payload["numResults"].(float64) != 1 {
+			t.Fatalf("unexpected numResults: %v", payload["numResults"])
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{
+			"requestId": "0fd858c75779cf0305efacbaa6fddfe8",
+			"resolvedSearchType": "neural",
+			"results": [{
+				"title": "Sam Altman",
+				"url": "https://blog.samaltman.com/the-gentle-singularity",
+				"text": "The Gentle Singularity - Sam Altman"
+			}]
+		}`))
+	}))
+	defer server.Close()
+
+	provider := &ExaSearchProvider{apiKey: "exa-test-key", endpoint: server.URL}
+	result, err := provider.Search(context.Background(), "sam altman blog", 1)
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+
+	if !strings.Contains(result, "Results for: sam altman blog (via Exa)") {
+		t.Fatalf("expected formatted heading, got: %s", result)
+	}
+	if !strings.Contains(result, "Sam Altman") || !strings.Contains(result, "https://blog.samaltman.com/the-gentle-singularity") {
+		t.Fatalf("expected result title/url, got: %s", result)
+	}
+}
+
+func TestExaSearchProvider_Search_HTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid api key"}`))
+	}))
+	defer server.Close()
+
+	provider := &ExaSearchProvider{apiKey: "bad-key", endpoint: server.URL}
+	_, err := provider.Search(context.Background(), "test", 1)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "status 401") || !strings.Contains(err.Error(), "invalid api key") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestWebTool_WebFetch_HTMLExtraction verifies HTML text extraction
 func TestWebTool_WebFetch_HTMLExtraction(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

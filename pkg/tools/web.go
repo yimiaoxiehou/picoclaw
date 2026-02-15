@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,127 @@ type SearchProvider interface {
 
 type BraveSearchProvider struct {
 	apiKey string
+}
+
+type ExaSearchProvider struct {
+	apiKey   string
+	endpoint string
+}
+
+type exaSearchResponse struct {
+	RequestID          string `json:"requestId"`
+	ResolvedSearchType string `json:"resolvedSearchType"`
+	Results            []struct {
+		Title string `json:"title"`
+		URL   string `json:"url"`
+		Text  string `json:"text"`
+	} `json:"results"`
+	Error string `json:"error"`
+}
+
+func (p *ExaSearchProvider) Search(ctx context.Context, query string, count int) (string, error) {
+	payload := map[string]interface{}{
+		"query": query,
+		"type":  "auto",
+		"contents": map[string]bool{
+			"text": true,
+		},
+		"numResults": count,
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode request body: %w", err)
+	}
+
+	endpoint := p.endpoint
+	if endpoint == "" {
+		endpoint = "https://api.exa.ai/search"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", p.apiKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var searchResp exaSearchResponse
+	if err := json.Unmarshal(body, &searchResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errMsg := strings.TrimSpace(searchResp.Error)
+		if errMsg == "" {
+			errMsg = strings.TrimSpace(string(body))
+		}
+		if truncatedMsg, truncated := truncateRunes(errMsg, 300); truncated {
+			errMsg = truncatedMsg + "..."
+		}
+		return "", fmt.Errorf("exa search failed with status %d: %s", resp.StatusCode, errMsg)
+	}
+
+	if len(searchResp.Results) == 0 {
+		return fmt.Sprintf("No results for: %s", query), nil
+	}
+
+	return formatExaResults(searchResp.Results, query, count), nil
+}
+
+func formatExaResults(results []struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+	Text  string `json:"text"`
+}, query string, count int) string {
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Results for: %s (via Exa)", query))
+	for i, item := range results {
+		if i >= count {
+			break
+		}
+		title := strings.TrimSpace(item.Title)
+		if title == "" {
+			title = item.URL
+		}
+		lines = append(lines, fmt.Sprintf("%d. %s\n   %s", i+1, title, item.URL))
+
+		snippet := strings.TrimSpace(item.Text)
+		if snippet != "" {
+			snippet, truncated := truncateRunes(snippet, 220)
+			if truncated {
+				snippet += "..."
+			}
+			lines = append(lines, fmt.Sprintf("   %s", snippet))
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func truncateRunes(text string, limit int) (string, bool) {
+	if limit <= 0 {
+		return "", len([]rune(text)) > 0
+	}
+	r := []rune(text)
+	if len(r) <= limit {
+		return text, false
+	}
+	return string(r[:limit]), true
 }
 
 func (p *BraveSearchProvider) Search(ctx context.Context, query string, count int) (string, error) {
@@ -192,6 +314,9 @@ type WebSearchToolOptions struct {
 	BraveAPIKey          string
 	BraveMaxResults      int
 	BraveEnabled         bool
+	ExaAPIKey            string
+	ExaMaxResults        int
+	ExaEnabled           bool
 	DuckDuckGoMaxResults int
 	DuckDuckGoEnabled    bool
 }
@@ -200,11 +325,16 @@ func NewWebSearchTool(opts WebSearchToolOptions) *WebSearchTool {
 	var provider SearchProvider
 	maxResults := 5
 
-	// Priority: Brave > DuckDuckGo
+	// Priority: Brave > Exa > DuckDuckGo
 	if opts.BraveEnabled && opts.BraveAPIKey != "" {
 		provider = &BraveSearchProvider{apiKey: opts.BraveAPIKey}
 		if opts.BraveMaxResults > 0 {
 			maxResults = opts.BraveMaxResults
+		}
+	} else if opts.ExaEnabled && opts.ExaAPIKey != "" {
+		provider = &ExaSearchProvider{apiKey: opts.ExaAPIKey}
+		if opts.ExaMaxResults > 0 {
+			maxResults = opts.ExaMaxResults
 		}
 	} else if opts.DuckDuckGoEnabled {
 		provider = &DuckDuckGoSearchProvider{}
