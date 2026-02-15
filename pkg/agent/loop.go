@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -83,6 +84,10 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 		registry.Register(searchTool)
 	}
 	registry.Register(tools.NewWebFetchTool(50000))
+
+	// Hardware tools (I2C, SPI) - Linux only, returns error on other platforms
+	registry.Register(tools.NewI2CTool())
+	registry.Register(tools.NewSPITool())
 
 	// Message tool - available to both agent and subagent
 	// Subagent uses it to communicate directly with user
@@ -767,10 +772,13 @@ func (al *AgentLoop) summarizeBatch(ctx context.Context, batch []providers.Messa
 }
 
 // estimateTokens estimates the number of tokens in a message list.
+// Uses rune count instead of byte length so that CJK and other multi-byte
+// characters are not over-counted (a Chinese character is 3 bytes but roughly
+// one token).
 func (al *AgentLoop) estimateTokens(messages []providers.Message) int {
 	total := 0
 	for _, m := range messages {
-		total += len(m.Content) / 4 // Simple heuristic: 4 chars per token
+		total += utf8.RuneCountInString(m.Content) / 3
 	}
 	return total
 }
